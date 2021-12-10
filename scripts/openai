@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+#
+# OpenAI CLI v2.2.2
+#   Created by @janlay
+#
+
+set -eo pipefail
+
+# openai-cli accepts various exported environment variables:
+#   OPENAI_API_KEY		: OpenAI's API key
+#   OPENAI_API_ENDPOINT	: Custom API endpoint
+#   OPENAI_MAX_TOKENS   : Maximum number of tokens to use
+#	OPENAI_CHAT_MODEL	: ChatGPT model
+#   OPENAI_DATA_DIR		: Directory to store data
+OPENAI_API_ENDPOINT="${OPENAI_API_ENDPOINT:-https://api.openai.com}"
+OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+OPENAI_MAX_TOKENS="${OPENAI_MAX_TOKENS:-2000}"
+OPENAI_CHAT_MODEL="${OPENAI_CHAT_MODEL:-gpt-3.5-turbo-1106}"
+declare _config_dir="${OPENAI_DATA_DIR:-$XDG_CONFIG_HOME}"
+OPENAI_DATA_DIR="${_config_dir:-$HOME/.openai}"
+
+# defaults
+readonly _app_name=openai _app_version=2.2.2
+readonly default_api_version=1 default_api_name=chat/completions default_model="$OPENAI_CHAT_MODEL" default_topic=General
+
+declare -i chat_mode=0 dry_run=0
+declare tokens_file="$OPENAI_DATA_DIR/total_tokens" api_version=$default_api_version api_name=$default_api_name topic=$default_topic
+declare dump_file dumped_file data_file temp_dir rest_args prompt_file prompt
+
+trap cleanup EXIT
+cleanup() {
+	[ -d "$temp_dir" ] || rm -f -- "$temp_dir"
+}
+
+raise_error() {
+	[ "$2" = 0 ] || echo -n "$_app_name: " >&2
+	echo -e "$1" >&2
+	exit "${2:-1}"
+}
+
+load_conversation() {
+	[ -f "$data_file" ] && cat "$data_file" || echo '{}'
+}
+
+update_conversation() {
+	local entry="$2" data
+	[[ $entry == \{* ]] || entry=$(jq -n --arg content "$entry" '{$content}')
+	entry=$(jq --arg role "$1" '. += {$role}' <<<"$entry")
+	data=$(load_conversation)
+	jq --argjson item "$entry" '.messages += [$item]' <<<"$data" >"$data_file"
+}
+
+save_tokens() {
+	local data num="$1"
+	[ -f "$data_file" ] && {
+		data=$(load_conversation)
+		jq --argjson tokens "$num" '.total_tokens += $tokens' <<<"$data" >"$data_file"
+	}
+
+	data=0
+	[ -f "$tokens_file" ] && data=$(cat "$tokens_file")
+	echo "$((data + num))" >"$tokens_file"
+}
+
+read_prompt() {
+	# read prompt from args first
+	local word accepts_props=1 props='{}' real_prompt
+	if [ ${#rest_args[@]} -gt 0 ]; then
+		# read file $prompt_file word by word, and extract words starting with '+'
+		for word in "${rest_args[@]}"; do
+			if [ $accepts_props -eq 1 ] && [ "${word:0:1}" = '+' ]; then
+				word="${word:1}"
+				# determine value's type for jq
+				local options=(--arg key "${word%%=*}") value="${word#*=}" arg=--arg
+				[[ $value =~ ^[+-]?\ ?[0-9.]+$ || $value = true || $value = false || $value == [\[\{]* ]] && arg=--argjson
+				options+=("$arg" value "$value")
+				props=$(jq "${options[@]}" '.[$key] = $value' <<<"$props")
+			else
+				real_prompt="$real_prompt $word"
+				accepts_props=0
+			fi
+		done
+		[ -n "$props" ] && echo "$props" >"$temp_dir/props"
+	fi
+
+	if [ -n "$real_prompt" ]; then
+		[ -n "$prompt_file" ] && echo "* Prompt file \`$prompt_file' will be ignored as the prompt parameters are provided." >&2
+		echo -n "${real_prompt:1}" >"$temp_dir/prompt"
+	elif [ -n "$prompt_file" ]; then
+		[ -f "$prompt_file" ] || raise_error "File not found: $prompt_file." 3
+		[[ -s $prompt_file ]] || raise_error "Empty file: $prompt_file." 4
+	fi
+}
+
+openai_models() {
+	call_api | jq
+}
+
+openai_moderations() {
+	local prop_file="$temp_dir/props" payload="{\"model\": \"text-moderation-latest\"}"
+
+	# overwrite default properties with user's
+	read_prompt
+	[ -f "$prop_file" ] && payload=$(jq -n --argjson payload "$payload" '$payload | . += input' <"$prop_file")
+
+	# append user's prompt to messages
+	local payload_file="$temp_dir/payload" input_file="$temp_dir/prompt"
+	[ -f "$input_file" ] || input_file="${prompt_file:-/dev/stdin}"
+	jq -Rs -cn --argjson payload "$payload" '$payload | .input = input' "$input_file" >"$payload_file"
+
+	call_api | jq -c '.results[]'
+}
+
+openai_images_generations() {
+	local prop_file="$temp_dir/props" payload="{\"n\": 1, \"size\": \"1024x1024\"}"
+
+	# overwrite default properties with user's
+	read_prompt
+	[ -f "$prop_file" ] && payload=$(jq -n --argjson payload "$payload" '$payload | . += input | . += {response_format: "url"}' <"$prop_file")
+
+	# append user's prompt to messages
+	local payload_file="$temp_dir/payload" input_file="$temp_dir/prompt"
+	[ -f "$input_file" ] || input_file="${prompt_file:-/dev/stdin}"
+	jq -Rs -cn --argjson payload "$payload" '$payload | .prompt = input' "$input_file" >"$payload_file"
+
+	call_api | jq -r '.data[].url'
+}
+
+openai_embeddings() {
+	local prop_file="$temp_dir/props" payload="{\"model\": \"text-embedding-ada-002\"}"
+
+	# overwrite default properties with user's
+	read_prompt
+	[ -f "$prop_file" ] && payload=$(jq -n --argjson payload "$payload" '$payload | . += input' <"$prop_file")
+
+	# append user's prompt to messages
+	local payload_file="$temp_dir/payload" input_file="$temp_dir/prompt"
+	[ -f "$input_file" ] || input_file="${prompt_file:-/dev/stdin}"
+	jq -Rs -cn --argjson payload "$payload" '$payload | .input = input' "$input_file" >"$payload_file"
+
+	call_api | jq -c
+}
+
+openai_chat_completions() {
+	[ -n "$dumped_file" ] || {
+		local prop_file="$temp_dir/props" payload="{\"model\": \"$default_model\", \"stream\": true, \"temperature\": 0.5, \"max_tokens\": $OPENAI_MAX_TOKENS}"
+
+		# overwrite default properties with user's
+		read_prompt
+		[ -f "$prop_file" ] && {
+			payload=$(jq -n --argjson payload "$payload" '$payload | . += input | . += {messages: []}' <"$prop_file")
+		}
+
+		local data
+		data=$(load_conversation | jq .messages)
+		[ "$topic" != "$default_topic" ] && {
+			if [ $chat_mode -eq 1 ]; then
+				# load all messages for chat mode
+				payload=$(jq --argjson messages "$data" 'setpath(["messages"]; $messages)' <<<"$payload")
+			else
+				# load only first message for non-chat mode
+				payload=$(jq --argjson messages "$data" 'setpath(["messages"]; [$messages[0]])' <<<"$payload")
+			fi
+		}
+		# append user's prompt to messages
+		local payload_file="$temp_dir/payload" input_file="$temp_dir/prompt"
+		[ -f "$input_file" ] || input_file="${prompt_file:-/dev/stdin}"
+		jq -Rs -cn --argjson payload "$payload" '$payload | .messages += [{role: "user", content: input}]' "$input_file" >"$payload_file"
+	}
+
+	local chunk reason text role fn_name
+	call_api | while read -r chunk; do
+		[ -z "$chunk" ] && continue
+		chunk=$(cut -d: -f2- <<<"$chunk" | jq '.choices[0]')
+		reason=$(jq -r '.finish_reason // empty' <<<"$chunk")
+		[[ $reason = stop || $reason = function_call ]] && break
+		[ -n "$reason" ] && raise_error "API error: $reason" 10
+
+		# get role and function info from the first chunk
+		[ -z "$role" ] && {
+			role=$(jq -r '.delta.role // empty' <<<"$chunk")
+			fn_name=$(jq -r '.delta.function_call.name // empty' <<<"$chunk")
+		}
+
+		# workaround: https://stackoverflow.com/a/15184414
+		chunk=$(
+			jq -r '.delta | .function_call.arguments // .content // empty' <<<"$chunk"
+			printf x
+		)
+		# ensure chunk is not empty
+		[ ${#chunk} -ge 2 ] || continue
+
+		chunk="${chunk:0:${#chunk}-2}"
+		text="$text$chunk"
+		echo -n "$chunk"
+	done
+
+	# append response to topic file for chat mode
+	[ "$chat_mode" -eq 1 ] && {
+		[ -n "$fn_name" ] && text=$(jq -n --arg name "$fn_name" --argjson arguments "${text:-\{\}}" '{function_call: {$name, $arguments}}')
+
+		update_conversation user "$prompt"
+		update_conversation "$role" "$text"
+	}
+	echo
+}
+
+# shellcheck disable=SC2120
+call_api() {
+	# return dumped file if specified
+	[ -n "$dumped_file" ] && {
+		cat "$dumped_file"
+		return
+	}
+
+	local url="$OPENAI_API_ENDPOINT/v$api_version/$api_name" auth="Bearer $OPENAI_API_KEY"
+
+	# dry-run mode
+	[ "$dry_run" -eq 1 ] && {
+		echo "Dry-run mode, no API calls made."
+		echo -e "\nRequest URL:\n--------------\n$url"
+		echo -en "\nAuthorization:\n--------------\n"
+		sed -E 's/(sk-.{3}).{41}/\1****/' <<<"$auth"
+		[ -n "$payload_file" ] && {
+			echo -e "\nPayload:\n--------------"
+			jq <"$payload_file"
+		}
+		exit 0
+	} >&2
+
+	local args=("$url" --no-buffer -fsSL -H 'Content-Type: application/json' -H "Authorization: $auth")
+	[ -n "$payload_file" ] && args+=(-d @"$payload_file")
+	[ $# -gt 0 ] && args+=("$@")
+
+	[ -n "$dump_file" ] && args+=(-o "$dump_file")
+	curl "${args[@]}"
+	[ -z "$dump_file" ] || exit 0
+}
+
+create_topic() {
+	update_conversation system "${rest_args[*]}"
